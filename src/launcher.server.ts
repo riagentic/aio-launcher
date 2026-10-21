@@ -1,0 +1,433 @@
+// Server-only I/O: git, am, deno, and launching built apps.
+import { basename, dirname, extname, join, SEPARATOR as SEP } from "@std/path";
+import {
+  type AppDef,
+  blankInfo,
+  ICONS,
+  type Info,
+  type Media,
+  type Place,
+  profileIdOf,
+  rawOf,
+  readmeOf,
+  type Run,
+  shotOf,
+  sourcesOf,
+  versionsOf,
+  webOf,
+} from "./apps.ts";
+
+const HOME = Deno.env.get("HOME") ?? Deno.env.get("USERPROFILE") ?? ".";
+const dec = (b: Uint8Array) => new TextDecoder().decode(b);
+const tail = (s: string, n = 6) => s.trim().split("\n").slice(-n).join("\n");
+
+/** Our own AIO_* / ELECTRON_* settings must not leak into the apps we build or run. */
+const env = (): Record<string, string> =>
+  Object.fromEntries(
+    Object.entries(Deno.env.toObject()).filter(([k]) =>
+      !/^(AIO_|ELECTRON_)/.test(k)
+    ),
+  );
+
+const DEFAULT_ROOT = join(HOME, ".aio-launcher", "apps");
+export const rootOf = (appsDir: string): string =>
+  appsDir ? appsDir.replace(/^~(?=[\\/]|$)/, HOME) : DEFAULT_ROOT;
+const workOf = (root: string, d: AppDef) => join(root, d.id, d.dir);
+
+async function run(cmd: string, args: string[], cwd: string) {
+  const out = await new Deno.Command(cmd, {
+    args,
+    cwd,
+    stdin: "null",
+    clearEnv: true,
+    env: { ...env(), GIT_TERMINAL_PROMPT: "0" },
+  }).output();
+  return {
+    ok: out.success,
+    out: dec(out.stdout).trim(),
+    all: dec(out.stdout) + dec(out.stderr),
+  };
+}
+
+/** run + append to the app's log + throw with the output tail on failure. */
+async function sh(
+  cmd: string,
+  args: string[],
+  cwd: string,
+  log: string,
+): Promise<string> {
+  const r = await run(cmd, args, cwd);
+  await Deno.writeTextFile(log, `$ ${cmd} ${args.join(" ")}\n${r.all}\n`, {
+    append: true,
+  });
+  if (!r.ok) throw new Error(`${cmd} ${args[0]} failed:\n${tail(r.all)}`);
+  return r.out;
+}
+
+const exists = (p: string) => Deno.stat(p).then(() => true, () => false);
+const logOf = async (root: string, d: AppDef) => {
+  await Deno.mkdir(root, { recursive: true });
+  return join(root, `${d.id}.log`);
+};
+
+const MARK = ".aio-launcher";
+
+/** Clones are reset and deleted only inside a folder the launcher owns: marked, or new/empty when first used. */
+async function own(root: string): Promise<void> {
+  if (await exists(join(root, MARK))) return;
+  const empty = await Array.fromAsync(Deno.readDir(root)).then(
+    (es) => es.length === 0,
+    () => true, // missing
+  );
+  if (!empty && root !== DEFAULT_ROOT) {
+    throw new Error(
+      `${root} is not empty and not an aio-launcher folder — choose an empty one`,
+    );
+  }
+  await Deno.mkdir(root, { recursive: true });
+  await Deno.writeTextFile(
+    join(root, MARK),
+    "Managed by AIO APPS LAUNCHER: app clones here are reset and deleted.\n",
+  );
+}
+
+/** Version fingerprint = the HEADs of every repo the app needs, space-joined. */
+export async function remoteHead(d: AppDef): Promise<string> {
+  const one = async (repo: string) => {
+    const r = await run("git", ["ls-remote", "--", repo, "HEAD"], HOME);
+    const head = r.out.split(/\s/)[0];
+    if (!r.ok || !head) {
+      throw new Error(tail(r.all, 2) || `${repo} has no HEAD`);
+    }
+    return head;
+  };
+  return (await Promise.all(sourcesOf(d).map((x) => one(x.repo)))).join(" ");
+}
+
+/** Clone each repo, or move an existing clone to its remote HEAD. Returns the new fingerprint. */
+export async function fetchRepo(appsDir: string, d: AppDef): Promise<string> {
+  const root = rootOf(appsDir);
+  await own(root);
+  const log = await logOf(root, d);
+  const heads: string[] = [];
+  for (const src of sourcesOf(d)) {
+    const dir = join(root, src.dir);
+    if (await exists(join(dir, ".git"))) {
+      await sh("git", ["fetch", "--depth=1", "origin", "HEAD"], dir, log);
+      await sh("git", ["reset", "--hard", "FETCH_HEAD"], dir, log); // launcher-owned clone
+    } else {
+      await sh("git", ["clone", "--depth=1", "--", src.repo, dir], root, log);
+    }
+    heads.push(await sh("git", ["rev-parse", "HEAD"], dir, log));
+  }
+  return heads.join(" ");
+}
+
+/** am fix links dep/aio + installs Electron; then build the electron target. Returns the binary. */
+export async function build(appsDir: string, d: AppDef): Promise<string> {
+  const root = rootOf(appsDir),
+    work = workOf(root, d),
+    log = await logOf(root, d);
+  await sh("am", ["fix"], work, log);
+  if (d.prebuild) await sh("deno", ["task", d.prebuild], work, log);
+  // not `compile`: its default target is per-app (mushradar: browser)
+  await sh("deno", ["task", "build", "--targets=electron"], work, log);
+  const bin = await artifactOf(work);
+  if (!bin) {
+    throw new Error(
+      "build finished but dist/manifest.json names no electron artifact",
+    );
+  }
+  return bin;
+}
+
+type Manifest = {
+  targets?: { target: string; ok: boolean; artifacts?: { file: string }[] }[];
+};
+
+async function artifactOf(work: string): Promise<string | undefined> {
+  const m: Manifest = await Deno.readTextFile(
+    join(work, "dist", "manifest.json"),
+  ).then(JSON.parse, () => ({}));
+  const file = m.targets?.find((t) => t.target === "electron" && t.ok)
+    ?.artifacts?.[0]?.file;
+  return file && await exists(join(work, "dist", file))
+    ? join(work, "dist", file)
+    : undefined;
+}
+
+/** What is already on disk: HEAD + built binary per app. */
+export async function scan(
+  appsDir: string,
+  defs: AppDef[],
+): Promise<
+  Record<string, { commit: string; artifact: string; info: Info }>
+> {
+  const root = rootOf(appsDir);
+  const one = async (d: AppDef) => {
+    const heads = await Promise.all(
+      sourcesOf(d).map(async (src) => {
+        const r = await run("git", ["rev-parse", "HEAD"], join(root, src.dir))
+          .catch(() => ({ ok: false, out: "" })); // no such folder
+        return r.ok ? r.out : "";
+      }),
+    );
+    const commit = heads.every(Boolean) ? heads.join(" ") : ""; // any repo missing = not installed
+    return [d.id, {
+      commit,
+      artifact: await artifactOf(workOf(root, d)) ?? "",
+      info: commit ? await localInfo(appsDir, d) : blankInfo(),
+    }] as const;
+  };
+  return Object.fromEntries(await Promise.all(defs.map(one)));
+}
+
+/** Start a built app detached — it outlives the launcher. */
+export function open(path: string): void {
+  new Deno.Command(path, {
+    stdin: "null",
+    stdout: "null",
+    stderr: "null",
+    clearEnv: true,
+    env: env(),
+  })
+    .spawn().unref();
+}
+
+/** Hand a URL or folder to the desktop (browser / file manager). */
+function launch(target: string): void {
+  const [cmd, ...args] = Deno.build.os === "darwin"
+    ? ["open"]
+    : Deno.build.os === "windows"
+    ? ["explorer"]
+    : ["xdg-open"];
+  new Deno.Command(cmd!, {
+    args: [...args, target],
+    stdin: "null",
+    stdout: "null",
+    stderr: "null",
+    clearEnv: true,
+    env: env(),
+  }).spawn().unref();
+}
+
+/** Open one of an app's places. Throws when it does not exist (yet). */
+export async function reveal(
+  appsDir: string,
+  d: AppDef,
+  artifact: string,
+  what: Place,
+): Promise<void> {
+  const work = workOf(rootOf(appsDir), d);
+  const need = async (p: string, why: string) => {
+    if (!p || !await exists(p)) throw new Error(why);
+    return p;
+  };
+  const url = (u: string) => {
+    if (!u) throw new Error(`${d.repo} has no web page`);
+    return u;
+  };
+  launch(
+    what === "readme"
+      ? url(readmeOf(d))
+      : what === "repo"
+      ? url(webOf(d.repo))
+      : what === "appDir"
+      ? await need(
+        artifact ? dirname(artifact) : work,
+        `${d.name} is not installed`,
+      )
+      : await need(
+        await profileOf(work),
+        `${d.name} has no profile yet — open it once`,
+      ),
+  );
+}
+
+async function profileOf(work: string): Promise<string> {
+  const cfg = await Deno.readTextFile(join(work, "deno.json")).then(
+    JSON.parse,
+    () => null,
+  );
+  return cfg ? join(HOME, `.${profileIdOf(cfg, basename(work))}`) : "";
+}
+
+/** Delete an app's clone + log, and its extra repos that no other app in `all` uses. Profile stays. */
+export async function remove(
+  appsDir: string,
+  d: AppDef,
+  all: AppDef[],
+): Promise<void> {
+  const root = rootOf(appsDir);
+  await own(root);
+  const shared = new Set(
+    all.filter((x) => x.id !== d.id).flatMap(sourcesOf).map((x) => x.dir),
+  );
+  const dirs = sourcesOf(d).map((x) => x.dir).filter((x) => !shared.has(x));
+  for (const p of [...dirs, `${d.id}.log`]) {
+    await Deno.remove(join(root, p), { recursive: true }).catch((e) => {
+      if (!(e instanceof Deno.errors.NotFound)) throw e;
+    });
+  }
+}
+
+// ── app info: icon, screenshot, versions ─────────────────────────────────────
+
+const json = (t: string | null) => {
+  try {
+    return t ? JSON.parse(t) : null;
+  } catch {
+    return null;
+  }
+};
+const firstOf = async <T>(xs: T[], ok: (x: T) => Promise<boolean>) => {
+  for (const x of xs) if (await ok(x)) return x;
+  return undefined;
+};
+
+/** Info from the installed copy. */
+export async function localInfo(appsDir: string, d: AppDef): Promise<Info> {
+  const root = rootOf(appsDir), repo = join(root, d.id), work = workOf(root, d);
+  const text = (p: string) =>
+    Deno.readTextFile(join(work, p)).catch(() => null);
+  const has = (p: string) => exists(join(work, p));
+  const git = (args: string[]) =>
+    run("git", args, repo).then((r) => (r.ok ? r.out : ""), () => "");
+  const built = join(work, ".aio", "build", "AppDir"); // aio's generated icon
+  const gen = await Array.fromAsync(Deno.readDir(built)).then(
+    (es) => es.find((e) => e.name.endsWith(".png"))?.name,
+    () => undefined,
+  );
+  const shot = shotOf(await text("README.md") ?? "");
+  return {
+    rev: await git(["rev-parse", "HEAD"]),
+    date: await git(["log", "-1", "--format=%cI"]),
+    ...versionsOf(
+      json(await text("deno.json")),
+      d.dir
+        ? json(
+          await Deno.readTextFile(join(repo, "deno.json")).catch(() => null),
+        )
+        : null,
+    ),
+    icon: await firstOf(ICONS, has) ??
+      (gen ? `.aio/build/AppDir/${gen}` : ""),
+    shot: await firstOf([shot, "docs/screenshot.png"].filter(Boolean), has) ??
+      "",
+  };
+}
+
+const MAX = 8 << 20; // a README image bigger than this is not a thumbnail
+/** GET a file, or null: failed, or over MAX (stopped at MAX, never buffered whole). */
+const get = async (url: string): Promise<Uint8Array | null> => {
+  const r = await fetch(url, { signal: AbortSignal.timeout(15_000) }).catch(
+    () => null,
+  );
+  if (!r?.ok || !r.body || Number(r.headers.get("content-length")) > MAX) {
+    await r?.body?.cancel();
+    return null;
+  }
+  const parts: Uint8Array[] = [];
+  let size = 0;
+  try {
+    for await (const p of r.body) {
+      size += p.length;
+      if (size > MAX) {
+        await r.body.cancel().catch(() => {});
+        return null;
+      }
+      parts.push(p);
+    }
+  } catch {
+    return null;
+  }
+  const b = new Uint8Array(size);
+  parts.reduce((at, p) => (b.set(p, at), at + p.length), 0);
+  return b;
+};
+const cacheOf = (root: string, id: string, path: string) =>
+  join(root, ".media", id, path.replaceAll("/", "_"));
+
+/** Info from the remote at `rev` (GitHub only); its icon + screenshot land in the media cache. */
+export async function remoteInfo(
+  appsDir: string,
+  d: AppDef,
+  rev: string,
+): Promise<Info> {
+  const base = rawOf(d, rev), root = rootOf(appsDir);
+  if (!base) throw new Error(`${d.repo} is not on GitHub`);
+  const text = async (url: string) => {
+    const b = await get(url);
+    return b && new TextDecoder().decode(b);
+  };
+  const cfg = await text(`${base}deno.json`);
+  if (cfg === null) throw new Error(`no deno.json in ${d.repo}`);
+  await Deno.mkdir(join(root, ".media", d.id), { recursive: true });
+  const keep = async (path: string) => {
+    const b = await get(base + path);
+    if (b) await Deno.writeFile(cacheOf(root, d.id, path), b);
+    return !!b;
+  };
+  const shot = shotOf(await text(`${base}README.md`) ?? "");
+  return {
+    rev,
+    date: "",
+    ...versionsOf(
+      json(cfg),
+      d.dir
+        ? json(await text(`${rawOf({ ...d, dir: "" }, rev)}deno.json`))
+        : null,
+    ),
+    icon: await firstOf(ICONS, keep) ?? "",
+    shot: await firstOf([shot, "docs/screenshot.png"].filter(Boolean), keep) ??
+      "",
+  };
+}
+
+const TYPES: Record<string, string> = {
+  ".png": "image/png",
+  ".svg": "image/svg+xml",
+  ".jpg": "image/jpeg",
+  ".jpeg": "image/jpeg",
+  ".webp": "image/webp",
+  ".gif": "image/gif",
+};
+
+/** dir/rel with symlinks resolved — throws when it leaves dir (a repo can ship a symlink). */
+async function inside(dir: string, rel: string): Promise<string> {
+  const [base, p] = await Promise.all([
+    Deno.realPath(dir),
+    Deno.realPath(join(dir, rel)),
+  ]);
+  if (!p.startsWith(base + SEP)) throw new Error("outside the app folder");
+  return p;
+}
+
+/** The /media route: an app's icon or screenshot, from its install or the cache. */
+export async function media(
+  appsDir: string,
+  d: AppDef,
+  r: Run | undefined,
+  kind: Media,
+): Promise<Response> {
+  const root = rootOf(appsDir), local = !!(r?.commit && r.info.rev);
+  const path = (local ? r!.info : r?.latest)?.[kind] ?? "";
+  const type = TYPES[extname(path).toLowerCase()];
+  const body = path && type
+    ? await inside(
+      local ? workOf(root, d) : join(root, ".media", d.id),
+      local ? path : basename(cacheOf(root, d.id, path)),
+    ).then((p) => Deno.readFile(p)).catch(() => null)
+    : null;
+  return body
+    ? new Response(body, {
+      headers: {
+        "content-type": type!,
+        "cache-control": "max-age=31536000, immutable", // the URL carries the rev
+        "content-security-policy":
+          "default-src 'none'; style-src 'unsafe-inline'", // an SVG from a repo runs nothing
+        "x-content-type-options": "nosniff",
+      },
+    })
+    : new Response("not found", { status: 404 });
+}
