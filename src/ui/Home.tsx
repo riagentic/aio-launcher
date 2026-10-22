@@ -36,8 +36,25 @@ export function Home(): JSX.Element {
     launcher.registry.filter((d) => actionOf(launcher.runs[d.id]) === "update")
       .length;
   const shown = viewOf(launcher.registry, launcher.runs, q, sort);
+  const missing = launcher.missing;
   return (
     <>
+      {missing.length
+        ? (
+          <div class="error missing" role="alert">
+            <b>
+              To install apps, first install{" "}
+              {missing.map((m) => m.tool).join(" and ")}
+            </b>{" "}
+            — then press “Check for updates” (top right):
+            {missing.map((m) => (
+              <div key={m.tool}>
+                {m.tool}: <code>{m.how}</code>
+              </div>
+            ))}
+          </div>
+        )
+        : null}
       <div class="toolbar">
         <button
           type="button"

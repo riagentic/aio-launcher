@@ -20,7 +20,10 @@ import {
 
 const HOME = Deno.env.get("HOME") ?? Deno.env.get("USERPROFILE") ?? ".";
 const dec = (b: Uint8Array) => new TextDecoder().decode(b);
-const tail = (s: string, n = 6) => s.trim().split("\n").slice(-n).join("\n");
+// deno-lint-ignore no-control-regex
+const plain = (s: string) => s.replace(/\x1b\[[0-9;?]*[A-Za-z]/g, "");
+const tail = (s: string, n = 6) =>
+  plain(s).trim().split("\n").slice(-n).join("\n");
 
 const OS = Deno.build.os;
 /** Where deno, am and git live when a desktop start (Finder, a menu) gave no shell PATH. */
@@ -49,18 +52,68 @@ export const rootOf = (appsDir: string): string =>
   appsDir ? appsDir.replace(/^~(?=[\\/]|$)/, HOME) : DEFAULT_ROOT;
 const workOf = (root: string, d: AppDef) => join(root, d.id, d.dir);
 
+/** The tools an install needs, and how to get each. */
+export const TOOLS: Record<string, string> = {
+  git: OS === "windows"
+    ? "winget install Git.Git"
+    : OS === "darwin"
+    ? "xcode-select --install"
+    : "your package manager, e.g. sudo apt install git",
+  am: OS === "windows"
+    ? "irm https://raw.githubusercontent.com/riagentic/aio/main/install.ps1 | iex"
+    : "curl -fsSL https://raw.githubusercontent.com/riagentic/aio/main/install.sh | sh",
+};
+TOOLS.deno = TOOLS.am!; // am's installer brings deno
+
+/** `cmd` as found on the PATH the launcher gives its children, or "". */
+async function which(cmd: string): Promise<string> {
+  const e = env(), key = Object.keys(e).find((k) => k.toUpperCase() === "PATH");
+  const exts = OS === "windows" ? [".exe", ".cmd", ".bat"] : [""];
+  for (const dir of (key ? e[key]! : "").split(OS === "windows" ? ";" : ":")) {
+    for (const x of exts) {
+      const p = join(dir, cmd + x);
+      if (dir && await Deno.stat(p).then((s) => s.isFile, () => false)) {
+        return p;
+      }
+    }
+  }
+  return "";
+}
+
+/** The TOOLS not on PATH — the UI says what to install instead of failing per app. */
+export async function missingTools(): Promise<{ tool: string; how: string }[]> {
+  const found = await Promise.all(Object.keys(TOOLS).map(which));
+  const gone = Object.keys(TOOLS).filter((_, i) => !found[i]);
+  return gone.filter((t) => t !== "deno" || !gone.includes("am")) // one installer for both
+    .map((tool) => ({ tool, how: TOOLS[tool]! }));
+}
+
 async function run(cmd: string, args: string[], cwd: string) {
   // Windows runs am through its .cmd shim — cmd.exe only ever sees our fixed words
   const [exe, argv] = OS === "windows" && cmd === "am"
     ? ["cmd", ["/d", "/c", "am", ...args]]
     : [cmd, args];
-  const out = await new Deno.Command(exe, {
-    args: argv,
-    cwd,
-    stdin: "null",
-    clearEnv: true,
-    env: { ...env(), GIT_TERMINAL_PROMPT: "0" },
-  }).output();
+  let out: Deno.CommandOutput;
+  try {
+    out = await new Deno.Command(exe, {
+      args: argv,
+      cwd,
+      stdin: "null",
+      clearEnv: true,
+      // no prompt may wait on a person: a git login window would hang the update check
+      env: {
+        ...env(),
+        GIT_TERMINAL_PROMPT: "0",
+        GCM_INTERACTIVE: "never",
+        NO_COLOR: "1",
+      },
+    }).output(); // a missing program throws here, synchronously
+  } catch (e) {
+    if (e instanceof Deno.errors.NotFound && TOOLS[cmd]) {
+      throw new Error(`${cmd} is not installed — get it: ${TOOLS[cmd]}`);
+    }
+    throw e;
+  }
   return {
     ok: out.success,
     out: dec(out.stdout).trim(),
@@ -79,9 +132,21 @@ async function sh(
   await Deno.writeTextFile(log, `$ ${cmd} ${args.join(" ")}\n${r.all}\n`, {
     append: true,
   });
-  if (!r.ok) throw new Error(`${cmd} ${args[0]} failed:\n${tail(r.all)}`);
+  if (!r.ok) {
+    throw new Error(
+      cmd === "git" && NO_ACCESS.test(r.all)
+        ? NO_ACCESS_MSG
+        : `${cmd} ${args[0]} failed:\n${tail(r.all)}`,
+    );
+  }
   return r.out;
 }
+
+/** What git says when a repo needs a login (private) or does not exist. */
+const NO_ACCESS =
+  /could not read Username|Authentication failed|Repository not found|terminal prompts disabled/;
+const NO_ACCESS_MSG =
+  "no access — the repo is private (needs a git login) or gone";
 
 const exists = (p: string) => Deno.stat(p).then(() => true, () => false);
 const logOf = async (root: string, d: AppDef) => {
@@ -116,7 +181,11 @@ export async function remoteHead(d: AppDef): Promise<string> {
     const r = await run("git", ["ls-remote", "--", repo, "HEAD"], HOME);
     const head = r.out.split(/\s/)[0];
     if (!r.ok || !head) {
-      throw new Error(tail(r.all, 2) || `${repo} has no HEAD`);
+      throw new Error(
+        NO_ACCESS.test(r.all)
+          ? NO_ACCESS_MSG
+          : tail(r.all, 2) || `${repo} has no HEAD`,
+      );
     }
     return head;
   };
@@ -142,12 +211,25 @@ export async function fetchRepo(appsDir: string, d: AppDef): Promise<string> {
   return heads.join(" ");
 }
 
-/** am fix links dep/aio + installs Electron; then build the electron target. Returns the binary. */
+/** am fix links dep/aio (+ installs Electron for an offline app); then build the electron target. Returns the binary. */
 export async function build(appsDir: string, d: AppDef): Promise<string> {
   const root = rootOf(appsDir),
     work = workOf(root, d),
     log = await logOf(root, d);
-  await sh("am", ["fix"], work, log);
+  // an online app starts from the shared Electron store: the build needs no Electron of its own
+  const cfg = await Deno.readTextFile(join(work, "deno.json")).then(
+    JSON.parse,
+    () => null,
+  );
+  const online = cfg?.build?.electronRuntime === "online";
+  await sh("am", online ? ["fix", "--no-download"] : ["fix"], work, log);
+  // launcher ≤ 0.1.3 unpacked macOS apps into dist/*.open — the build refuses foreign files there
+  const dist = join(work, "dist");
+  for (const e of await Array.fromAsync(Deno.readDir(dist)).catch(() => [])) {
+    if (e.name.endsWith(".open")) {
+      await Deno.remove(join(dist, e.name), { recursive: true });
+    }
+  }
   if (d.prebuild) await sh("deno", ["task", d.prebuild], work, log);
   // not `compile`: its default target is per-app (mushradar: browser)
   await sh("deno", ["task", "build", "--targets=electron"], work, log);
@@ -204,29 +286,54 @@ export async function scan(
   return Object.fromEntries(await Promise.all(defs.map(one)));
 }
 
-/** Start a built app detached — it outlives the launcher. */
-export async function open(path: string): Promise<void> {
-  if (OS === "darwin") return launch(await macApp(path));
-  new Deno.Command(path, {
+/** An AppImage mounts itself with FUSE; where FUSE is missing it can unpack and run instead. */
+const noFuse = async () =>
+  OS === "linux" &&
+  !(await exists("/dev/fuse") &&
+    !!(await which("fusermount3") || await which("fusermount")));
+
+/** Start a built app detached — it outlives the launcher. Throws when it quits failing right away. */
+export async function open(
+  appsDir: string,
+  d: AppDef,
+  artifact: string,
+): Promise<void> {
+  // macOS: the program inside the .app, run directly — `open` would drop our environment
+  const exe = OS === "darwin"
+    ? await macExe(join(rootOf(appsDir), ".open", d.id), artifact)
+    : artifact;
+  const child = new Deno.Command(exe, {
     stdin: "null",
     stdout: "null",
     stderr: "null",
     clearEnv: true,
-    env: env(),
-  })
-    .spawn().unref();
+    env: {
+      ...env(),
+      AIO_MOVE_TO_APPLICATIONS: "never", // the launcher owns where the app lives
+      ...(await noFuse() ? { APPIMAGE_EXTRACT_AND_RUN: "1" } : {}),
+    },
+  }).spawn();
+  child.unref();
+  const quit = await Promise.race([
+    child.status,
+    new Promise<null>((r) => setTimeout(r, 5_000, null)),
+  ]);
+  if (quit && !quit.success) {
+    throw new Error(
+      `${
+        basename(artifact)
+      } quit at start (exit code ${quit.code}) — its log is in ⋯ → Profile Directory`,
+    );
+  }
 }
 
-/** macOS ships a .app inside an archive: unpack it beside the archive once, return the .app. */
-async function macApp(archive: string): Promise<string> {
-  const dir = archive.replace(/\.(app\.tar\.gz|zip|dmg)$/, ".open");
-  const find = () =>
-    Array.fromAsync(Deno.readDir(dir)).then(
-      (es) => es.find((e) => e.name.endsWith(".app"))?.name,
-      () => undefined,
-    );
-  let app = await find();
-  if (!app) {
+/** macOS ships a .app inside an archive: unpack it into `dir` (again when the archive
+ *  changed — never into dist/, which the next build refuses to empty), return its program. */
+async function macExe(dir: string, archive: string): Promise<string> {
+  const stamp = join(dir, ".from"),
+    want = `${archive} ${(await Deno.stat(archive)).mtime?.getTime()}`;
+  if (await Deno.readTextFile(stamp).catch(() => "") !== want) {
+    await Deno.remove(dir, { recursive: true }).catch(() => {});
     await Deno.mkdir(dir, { recursive: true });
     const x = async (cmd: string, args: string[]) => {
       const r = await run(cmd, args, dir);
@@ -250,10 +357,15 @@ async function macApp(archive: string): Promise<string> {
     } else if (archive.endsWith(".zip")) {
       await x("ditto", ["-x", "-k", archive, dir]);
     } else await x("tar", ["-xzf", archive, "-C", dir]);
-    app = await find();
+    await Deno.writeTextFile(stamp, want);
   }
+  const app = (await Array.fromAsync(Deno.readDir(dir)))
+    .find((e) => e.name.endsWith(".app"))?.name;
   if (!app) throw new Error(`no .app inside ${basename(archive)}`);
-  return join(dir, app);
+  const bin = join(dir, app, "Contents", "MacOS");
+  const exe = (await Array.fromAsync(Deno.readDir(bin))).find((e) => e.isFile);
+  if (!exe) throw new Error(`no program inside ${app}`);
+  return join(bin, exe.name);
 }
 
 /** Hand a URL or folder to the desktop (browser / file manager). */
@@ -314,7 +426,7 @@ async function profileOf(work: string): Promise<string> {
   return cfg ? join(HOME, `.${profileIdOf(cfg, basename(work))}`) : "";
 }
 
-/** Delete an app's clone + log, and its extra repos that no other app in `all` uses. Profile stays. */
+/** Delete an app's clone, log and unpacked macOS copy, and its extra repos that no other app in `all` uses. Profile stays. */
 export async function remove(
   appsDir: string,
   d: AppDef,
@@ -326,7 +438,7 @@ export async function remove(
     all.filter((x) => x.id !== d.id).flatMap(sourcesOf).map((x) => x.dir),
   );
   const dirs = sourcesOf(d).map((x) => x.dir).filter((x) => !shared.has(x));
-  for (const p of [...dirs, `${d.id}.log`]) {
+  for (const p of [...dirs, `${d.id}.log`, join(".open", d.id)]) {
     await Deno.remove(join(root, p), { recursive: true }).catch((e) => {
       if (!(e instanceof Deno.errors.NotFound)) throw e;
     });

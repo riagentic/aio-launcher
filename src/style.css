@@ -623,3 +623,12 @@ main {
   overflow: hidden;
   text-overflow: ellipsis;
 }
+.error.missing {
+  max-height: none;
+  margin-bottom: 1rem;
+  white-space: normal;
+  line-height: 1.7;
+}
+.error.missing code {
+  user-select: all;
+}

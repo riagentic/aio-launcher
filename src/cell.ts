@@ -18,6 +18,7 @@ export type State = {
   runs: Record<string, Run>;
   checking: boolean;
   checkedAt: number; // last finished update check (ms, 0 = never)
+  missing: { tool: string; how: string }[]; // not on PATH — installs cannot run
 };
 
 /** v1 entries had no extras/prebuild: a known app takes the defaults' values. */
@@ -69,8 +70,21 @@ async function job(
   }
 }
 
+let line: Promise<unknown> = Promise.resolve();
+/** One install at a time: parallel `am fix` runs race on aio's shared install, parallel builds swamp the machine. */
+const inTurn = <T>(f: () => Promise<T>): Promise<T> => {
+  const p = line.then(f);
+  line = p.catch(() => {});
+  return p;
+};
+
 /** Clone/fetch → build; the fingerprint and binary land in the run. */
-async function setup(d: AppDef, r: () => Run, x: Io): Promise<void> {
+const setup = (d: AppDef, r: () => Run, x: Io): Promise<void> => {
+  r().step = "Waiting for other installs…";
+  return inTurn(() => build(d, r, x));
+};
+
+async function build(d: AppDef, r: () => Run, x: Io): Promise<void> {
   r().step = "Downloading…";
   const commit = await x.fetchRepo(x.dir, d);
   Object.assign(r(), {
@@ -99,6 +113,7 @@ export const launcher = cell("launcher", {
     runs: {},
     checking: false,
     checkedAt: 0,
+    missing: [],
   } as State,
   persist: { include: ["registry", "appsDir"] },
   long: ["install", "reinstall", "updateAll"],
@@ -137,8 +152,9 @@ export const launcher = cell("launcher", {
     async check(s) {
       s.checking = true;
       try {
-        const defs = s.registry.map((d) => ({ ...d }));
-        const dir = s.appsDir, { remoteHead, remoteInfo } = await io();
+        const defs = s.registry.map((d) => ({ ...d })), dir = s.appsDir;
+        const { remoteHead, remoteInfo, missingTools } = await io();
+        s.missing = await missingTools();
         await Promise.all(defs.map(async (d) => {
           const head = await remoteHead(d).then(
             (h) => ({ h, e: "" }),
@@ -153,7 +169,8 @@ export const launcher = cell("launcher", {
           if (latest) r.latest = latest;
           if (r.busy) return;
           if (head.h) r.remote = head.h;
-          if (head.e || r.error.startsWith("update check:")) r.error = head.e; // keep install errors
+          const e = s.missing.some((m) => m.tool === "git") ? "" : head.e; // the banner says it once
+          if (e || r.error.startsWith("update check:")) r.error = e; // keep install errors
         }));
         s.checkedAt = Date.now();
       } finally {
@@ -162,6 +179,7 @@ export const launcher = cell("launcher", {
     },
     /** Install or update: clone/fetch → am fix → deno task build --targets=electron. */
     async install(s, id: string) {
+      s.missing = await (await io()).missingTools();
       await job(s, id, "Downloading…", setup);
     },
     /** Update every app that has one, one build at a time. */
@@ -197,9 +215,11 @@ export const launcher = cell("launcher", {
       );
     },
     async open(s, id: string) {
-      const path = s.runs[id]?.artifact;
-      if (!path) throw new Error(`${id} is not built`);
-      await (await io()).open(path);
+      const path = s.runs[id]?.artifact,
+        dir = s.appsDir,
+        d = s.registry.find((x) => x.id === id);
+      if (!path || !d) throw new Error(`${id} is not built`);
+      await (await io()).open(dir, { ...d }, path);
     },
   },
 });

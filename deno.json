@@ -1,7 +1,7 @@
 {
   "aioVersion": "v1.0.23-beta",
   "title": "aio-launcher",
-  "version": "0.1",
+  "version": "0.2",
   "client": "electron",
   "build": {
     "targets": [

@@ -24,8 +24,18 @@ amui · bsv · cc · fixable · fjssm · llama.master · machine · mdview · mu
 
 ## Requirements
 
-`git`, `deno` and [`am`](https://github.com/riagentic/aio) on `PATH`. Some apps
-need more to build (e.g. `machine`: Rust + `wasm32-unknown-unknown`).
+`git`, `deno` and [`am`](https://github.com/riagentic/aio) on `PATH` — the
+launcher says which one is missing and how to get it:
+
+- 🐧 Linux / 🍎 macOS:
+  `curl -fsSL https://raw.githubusercontent.com/riagentic/aio/main/install.sh | sh`
+- 🪟 Windows: `winget install Git.Git`, then
+  `irm https://raw.githubusercontent.com/riagentic/aio/main/install.ps1 | iex`
+
+Electron downloads once per machine (~100 MB, the launcher's first start); every
+app shares it.
+
+🍎 The macOS build is unsigned: right-click → **Open** the first time.
 
 > ⚠️ Installing an app runs its repo's own build code. Add only repos you trust.
 
@@ -42,9 +52,12 @@ Apps go to `~/.aio-launcher/apps` (change it in Settings).
 ## How an app is installed
 
 1. `git clone --depth=1` (plus any extra repos beside it)
-2. `am fix`
+2. `am fix` (`--no-download` for an online app: it starts from the shared
+   Electron)
 3. `deno task <pre-build>` if set
 4. `deno task build --targets=electron` → the Electron artifact in `dist/`
+
+One install runs at a time; the others wait their turn.
 
 Card info comes from the app's own files: `deno.json` (`version`, `aioVersion`),
 its icon (`src/icon.svg|png`, `assets/icon.*`), and the first image in its

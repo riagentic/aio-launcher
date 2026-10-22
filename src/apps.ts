@@ -122,7 +122,7 @@ export const DEFAULT_APPS: AppDef[] = [
     dir: "",
     about: "Live hardware monitor for your PC",
     extras: [],
-    prebuild: "wasm", // Rust → src/syscalls.wasm (needs cargo + wasm32 target)
+    prebuild: "wasm", // rebuilds src/syscalls.wasm with Rust; keeps the committed one without
   },
   {
     id: "llama-master",
