@@ -369,3 +369,18 @@ export const viewOf = (
         : a.name.localeCompare(b.name)
     );
 };
+
+/** The built file that opens an app on this OS, best first (Deno.build.os names). */
+const OPENS: Record<string, RegExp[]> = {
+  linux: [/\.AppImage$/],
+  windows: [/\.exe$/], // the one-click SFX
+  darwin: [/\.app\.tar\.gz$/, /\.zip$/, /\.dmg$/], // unpacked to a .app once
+};
+
+export const pickArtifact = (files: string[], os: string): string => {
+  for (const re of OPENS[os] ?? []) {
+    const f = files.find((x) => re.test(x));
+    if (f) return f;
+  }
+  return "";
+};

@@ -7,6 +7,7 @@ import {
   DEFAULT_APPS,
   idOf,
   mediaUrl,
+  pickArtifact,
   profileIdOf,
   rawOf,
   readmeOf,
@@ -192,4 +193,12 @@ Deno.test("viewOf: search, then sort", () => {
   assertEquals(ids("markdown", "name"), ["mdview"]);
   assertEquals(ids("", "status")[0], "mdview"); // the update comes first
   assertEquals(ids("", "name")[0], "amui");
+});
+
+Deno.test("pickArtifact: the file that opens on each OS", () => {
+  const f = ["a.zip", "a.exe", "a.AppImage", "a.dmg", "a.app.tar.gz"];
+  assertEquals(pickArtifact(f, "linux"), "a.AppImage");
+  assertEquals(pickArtifact(f, "windows"), "a.exe"); // not the zip
+  assertEquals(pickArtifact(f, "darwin"), "a.app.tar.gz");
+  assertEquals(pickArtifact(["a.zip"], "linux"), "");
 });

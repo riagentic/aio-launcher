@@ -6,6 +6,7 @@ import {
   ICONS,
   type Info,
   type Media,
+  pickArtifact,
   type Place,
   profileIdOf,
   rawOf,
@@ -21,13 +22,27 @@ const HOME = Deno.env.get("HOME") ?? Deno.env.get("USERPROFILE") ?? ".";
 const dec = (b: Uint8Array) => new TextDecoder().decode(b);
 const tail = (s: string, n = 6) => s.trim().split("\n").slice(-n).join("\n");
 
+const OS = Deno.build.os;
+/** Where deno, am and git live when a desktop start (Finder, a menu) gave no shell PATH. */
+const TOOL_DIRS = [
+  join(HOME, ".deno", "bin"),
+  join(HOME, ".local", "bin"),
+  ...(OS === "darwin" ? ["/opt/homebrew/bin", "/usr/local/bin"] : []),
+];
+
 /** Our own AIO_* / ELECTRON_* settings must not leak into the apps we build or run. */
-const env = (): Record<string, string> =>
-  Object.fromEntries(
+const env = (): Record<string, string> => {
+  const e = Object.fromEntries(
     Object.entries(Deno.env.toObject()).filter(([k]) =>
       !/^(AIO_|ELECTRON_)/.test(k)
     ),
   );
+  const key = Object.keys(e).find((k) => k.toUpperCase() === "PATH") ?? "PATH";
+  const sep = OS === "windows" ? ";" : ":";
+  const have = (e[key] ?? "").split(sep).filter(Boolean);
+  e[key] = [...have, ...TOOL_DIRS.filter((d) => !have.includes(d))].join(sep);
+  return e;
+};
 
 const DEFAULT_ROOT = join(HOME, ".aio-launcher", "apps");
 export const rootOf = (appsDir: string): string =>
@@ -35,8 +50,12 @@ export const rootOf = (appsDir: string): string =>
 const workOf = (root: string, d: AppDef) => join(root, d.id, d.dir);
 
 async function run(cmd: string, args: string[], cwd: string) {
-  const out = await new Deno.Command(cmd, {
-    args,
+  // Windows runs am through its .cmd shim — cmd.exe only ever sees our fixed words
+  const [exe, argv] = OS === "windows" && cmd === "am"
+    ? ["cmd", ["/d", "/c", "am", ...args]]
+    : [cmd, args];
+  const out = await new Deno.Command(exe, {
+    args: argv,
     cwd,
     stdin: "null",
     clearEnv: true,
@@ -149,8 +168,11 @@ async function artifactOf(work: string): Promise<string | undefined> {
   const m: Manifest = await Deno.readTextFile(
     join(work, "dist", "manifest.json"),
   ).then(JSON.parse, () => ({}));
-  const file = m.targets?.find((t) => t.target === "electron" && t.ok)
-    ?.artifacts?.[0]?.file;
+  const file = pickArtifact(
+    (m.targets ?? []).filter((t) => t.ok && t.target.startsWith("electron"))
+      .flatMap((t) => t.artifacts ?? []).map((a) => a.file),
+    OS,
+  );
   return file && await exists(join(work, "dist", file))
     ? join(work, "dist", file)
     : undefined;
@@ -183,7 +205,8 @@ export async function scan(
 }
 
 /** Start a built app detached — it outlives the launcher. */
-export function open(path: string): void {
+export async function open(path: string): Promise<void> {
+  if (OS === "darwin") return launch(await macApp(path));
   new Deno.Command(path, {
     stdin: "null",
     stdout: "null",
@@ -194,11 +217,50 @@ export function open(path: string): void {
     .spawn().unref();
 }
 
+/** macOS ships a .app inside an archive: unpack it beside the archive once, return the .app. */
+async function macApp(archive: string): Promise<string> {
+  const dir = archive.replace(/\.(app\.tar\.gz|zip|dmg)$/, ".open");
+  const find = () =>
+    Array.fromAsync(Deno.readDir(dir)).then(
+      (es) => es.find((e) => e.name.endsWith(".app"))?.name,
+      () => undefined,
+    );
+  let app = await find();
+  if (!app) {
+    await Deno.mkdir(dir, { recursive: true });
+    const x = async (cmd: string, args: string[]) => {
+      const r = await run(cmd, args, dir);
+      if (!r.ok) throw new Error(`${cmd} failed:\n${tail(r.all)}`);
+    };
+    if (archive.endsWith(".dmg")) {
+      const mnt = `${dir}.mnt`;
+      await x("hdiutil", [
+        "attach",
+        "-nobrowse",
+        "-readonly",
+        "-mountpoint",
+        mnt,
+        archive,
+      ]);
+      try {
+        await x("sh", ["-c", 'cp -R "$1"/*.app "$2"/', "sh", mnt, dir]);
+      } finally {
+        await run("hdiutil", ["detach", mnt], dir);
+      }
+    } else if (archive.endsWith(".zip")) {
+      await x("ditto", ["-x", "-k", archive, dir]);
+    } else await x("tar", ["-xzf", archive, "-C", dir]);
+    app = await find();
+  }
+  if (!app) throw new Error(`no .app inside ${basename(archive)}`);
+  return join(dir, app);
+}
+
 /** Hand a URL or folder to the desktop (browser / file manager). */
 function launch(target: string): void {
-  const [cmd, ...args] = Deno.build.os === "darwin"
+  const [cmd, ...args] = OS === "darwin"
     ? ["open"]
-    : Deno.build.os === "windows"
+    : OS === "windows"
     ? ["explorer"]
     : ["xdg-open"];
   new Deno.Command(cmd!, {

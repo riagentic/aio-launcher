@@ -199,7 +199,7 @@ export const launcher = cell("launcher", {
     async open(s, id: string) {
       const path = s.runs[id]?.artifact;
       if (!path) throw new Error(`${id} is not built`);
-      (await io()).open(path);
+      await (await io()).open(path);
     },
   },
 });
