@@ -45,3 +45,30 @@ testUI(
     }
   },
 );
+
+testUI(
+  App,
+  "a waiting launcher release shows its update button",
+  async (ui) => {
+    const nav = () => ui.document.querySelector("nav")?.textContent ?? "";
+    if (nav().includes("Update launcher")) throw new Error("shown early");
+    ui.seed({
+      updates: {
+        status: "available",
+        available: {
+          version: "0.3.1",
+          reason: "newer version",
+          notes: null,
+          size: null,
+          releasedAt: null,
+          migrates: false,
+          signed: true,
+          keyFingerprint: null,
+        },
+      },
+    });
+    await ui.waitFor(() => nav().includes("Update launcher to v0.3.1"));
+    ui.seed({ updates: { status: "downloading", progress: 0.5 } });
+    await ui.waitFor(() => nav().includes("Updating launcher… 50%"));
+  },
+);

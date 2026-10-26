@@ -1,0 +1,53 @@
+# Release: build every platform on one Linux runner, attach it to the GitHub release.
+#
+# Assets: AppImage · win exe + zip · mac zips, plus each platform's
+# <os>-<arch>.json manifest — a release build of the launcher reads those from
+# releases/latest/download/ and offers "Update launcher to vX".
+# No signing key, no external host: unsigned on purpose (src/app.ts).
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # the build number is the commit count
+
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.9.7
+
+      - name: Install aio at the pinned version
+        run: |
+          set -euo pipefail
+          ref=$(deno eval 'console.log(JSON.parse(Deno.readTextFileSync("deno.json")).aioVersion)')
+          curl -fsSL "https://raw.githubusercontent.com/riagentic/aio/$ref/install.sh" | AIO_REF="$ref" sh
+          echo "$HOME/.deno/bin" >> "$GITHUB_PATH"
+
+      - name: Link the framework
+        run: |
+          set -euo pipefail
+          am fix --no-download
+          # a fresh aio resolves a few lock entries differently; the build must
+          # be the committed one, or publish refuses it as a dirty tree
+          git diff --stat
+          git checkout -- deno.lock
+
+      - name: Build every platform with its manifest
+        run: |
+          set -euo pipefail
+          git status --porcelain # a dirty tree is refused below; show why
+          am publish --channel=prod --dir=out
+          ls -l out/prod
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: out/prod/*

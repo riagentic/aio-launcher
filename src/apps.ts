@@ -160,7 +160,48 @@ export const DEFAULT_APPS: AppDef[] = [
     extras: [],
     prebuild: "",
   },
+  {
+    id: "ayd",
+    name: "ayd",
+    repo: "https://github.com/riagentic/ayd",
+    dir: "",
+    about: "YouTube video downloader (yt-dlp)",
+    extras: [],
+    prebuild: "",
+  },
+  {
+    id: "calcaio",
+    name: "calcaio",
+    repo: "https://github.com/riagentic/calcaio",
+    dir: "",
+    about: "Scientific calculator",
+    extras: [],
+    prebuild: "",
+  },
+  {
+    id: "space-invaders",
+    name: "Space Invaders",
+    repo: "https://github.com/riagentic/space-invaders",
+    dir: "",
+    about: "Neon arcade game",
+    extras: [],
+    prebuild: "",
+  },
 ];
+
+/** Defaults not offered yet join the list; one the user removed stays removed. */
+export const withNewDefaults = (
+  registry: AppDef[],
+  offered: string[],
+): { registry: AppDef[]; offered: string[] } => ({
+  registry: [
+    ...registry,
+    ...DEFAULT_APPS.filter((d) =>
+      !offered.includes(d.id) && !registry.some((x) => x.id === d.id)
+    ),
+  ],
+  offered: [...new Set([...offered, ...DEFAULT_APPS.map((d) => d.id)])],
+});
 
 export const LABEL: Record<Action, string> = {
   install: "Install",
@@ -317,6 +358,14 @@ export const rawOf = (d: AppDef, rev = "HEAD"): string => {
 };
 
 /** "0.4", "0.3 → 0.4" — the version strip on a card. */
+/** The button text: "Update to v0.4" only when the version moves, else plain "Update". */
+export const goLabel = (r?: Run): string => {
+  const act = actionOf(r), next = r?.latest.version;
+  return act === "update" && next && next !== r?.info.version
+    ? `Update to v${next}`
+    : LABEL[act];
+};
+
 export const versionLabel = (r?: Run): string => {
   const now = r?.info.version, next = r?.latest.version;
   return !r?.commit

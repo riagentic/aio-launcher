@@ -1,5 +1,6 @@
 // Launcher cell — the app list (settings, persisted) + per-app status (rebuilt from disk at boot).
 import { cell } from "aio";
+import { updates } from "aio/updates";
 import {
   actionOf,
   type AppDef,
@@ -10,10 +11,12 @@ import {
   type Place,
   PLACES,
   type Run,
+  withNewDefaults,
 } from "./apps.ts";
 
 export type State = {
   registry: AppDef[];
+  offered: string[]; // default app ids already added once — a removed one is not re-added
   appsDir: string;
   runs: Record<string, Run>;
   checking: boolean;
@@ -34,6 +37,7 @@ const msg = (e: unknown) => (e instanceof Error ? e.message : String(e));
 
 /** Fold what is on disk into the runs; an app mid-install keeps its own view. */
 async function rescan(s: State): Promise<void> {
+  Object.assign(s, withNewDefaults(s.registry, s.offered));
   const found = await (await io()).scan(
     s.appsDir,
     s.registry.map((d) => ({ ...d })),
@@ -93,30 +97,61 @@ async function build(d: AppDef, r: () => Run, x: Io): Promise<void> {
     artifact: "",
     step: "Building…",
   });
+  r().info = await x.localInfo(x.dir, d); // the new source's version, built or not
   r().artifact = await x.build(x.dir, d);
-  r().info = await x.localInfo(x.dir, d);
 }
+
+/** The defaults v2 shipped, frozen: every later one is new to a v2 store. */
+const V2_DEFAULTS = [
+  "amui",
+  "mdview",
+  "bsv",
+  "fixable",
+  "mushradar",
+  "cc",
+  "spacy",
+  "netmap",
+  "machine",
+  "llama-master",
+  "protector",
+  "writy",
+  "fjssm",
+];
+
+/** Stored v1/v2 → v3. `s` arrives merged with the defaults, so `offered` is set here, not `??`-ed. */
+export const migrate = (s: State, from: number): State => ({
+  ...s,
+  registry: (s.registry as V1[]).map(upgrade),
+  offered: from < 3 ? V2_DEFAULTS : s.offered,
+});
 
 const wipe = (r: Run) =>
   Object.assign(r, { commit: "", artifact: "", info: blankInfo() });
 
 export const launcher = cell("launcher", {
-  version: 2,
-  // v2: entries gained extras + prebuild
-  onMigrate: (s) => ({
-    ...s,
-    registry: (s.registry as V1[]).map(upgrade),
-  }),
+  version: 3,
+  // v2: entries gained extras + prebuild · v3: `offered` (see V2_DEFAULTS)
+  onMigrate: migrate,
   state: {
     registry: DEFAULT_APPS,
+    offered: DEFAULT_APPS.map((d) => d.id),
     appsDir: "",
     runs: {},
     checking: false,
     checkedAt: 0,
     missing: [],
   } as State,
-  persist: { include: ["registry", "appsDir"] },
-  long: ["install", "reinstall", "updateAll"],
+  persist: { include: ["registry", "offered", "appsDir"] },
+  long: [
+    "install",
+    "reinstall",
+    "updateAll",
+    "uninstall",
+    "open",
+    "check",
+    "selfCheck",
+    "selfUpdate",
+  ],
   args: {
     reveal: [null, (v) => PLACES.includes(v as Place) || "unknown place"],
   },
@@ -143,12 +178,18 @@ export const launcher = cell("launcher", {
         );
       }
       s.appsDir = d;
-      s.runs = {};
+      // the remote HEAD is the same anywhere; info + media cache belong to the old folder
+      s.runs = Object.fromEntries(
+        Object.entries(s.runs).map((
+          [id, r],
+        ) => [id, { ...blankRun(), remote: r.remote }]),
+      );
       await rescan(s);
     },
     /** Read what is installed + built from disk. */
     scan: rescan,
     /** Ask each remote for its HEAD — a newer one turns Open into Update. */
+    // aio-ok: re-reads runs after each await on purpose — an install may have moved them
     async check(s) {
       s.checking = true;
       try {
@@ -164,13 +205,14 @@ export const launcher = cell("launcher", {
           const latest = rev && rev !== s.runs[d.id]?.latest.rev
             ? await remoteInfo(dir, d, rev).catch(() => null) // no info ≠ no update
             : null;
+          if (s.appsDir !== dir) return; // folder changed meanwhile: its media is elsewhere
           if (!s.registry.some((x) => x.id === d.id)) return; // removed meanwhile
           const r = (s.runs[d.id] ??= blankRun());
           if (latest) r.latest = latest;
           if (r.busy) return;
           if (head.h) r.remote = head.h;
           const e = s.missing.some((m) => m.tool === "git") ? "" : head.e; // the banner says it once
-          if (e || r.error.startsWith("update check:")) r.error = e; // keep install errors
+          if (!r.error || r.error.startsWith("update check:")) r.error = e; // keep install errors
         }));
         s.checkedAt = Date.now();
       } finally {
@@ -182,11 +224,28 @@ export const launcher = cell("launcher", {
       s.missing = await (await io()).missingTools();
       await job(s, id, "Downloading…", setup);
     },
-    /** Update every app that has one, one build at a time. */
+    /** Update every app that has one: all queue at once, `inTurn` builds one at a time. */
     async updateAll(s) {
       const ids = s.registry.filter((d) => actionOf(s.runs[d.id]) === "update")
         .map((d) => d.id);
-      for (const id of ids) await job(s, id, "Downloading…", setup);
+      await Promise.all(ids.map((id) => job(s, id, "Downloading…", setup)));
+    },
+    /** The launcher's own update: mirror the newest GitHub release, let aio's updater judge it. */
+    async selfCheck() {
+      const x = await io();
+      if (x.FROM_SOURCE) return;
+      await x.mirrorRelease(false);
+      await updates.check();
+    },
+    /** Download that release and hand it to aio's updater: verify, swap, restart. */
+    async selfUpdate() {
+      const x = await io();
+      if (x.FROM_SOURCE) {
+        throw new Error("running from source — update with git pull");
+      }
+      await x.mirrorRelease(true);
+      await updates.check();
+      await updates.apply();
     },
     /** Delete the app's files, then install it fresh. */
     async reinstall(s, id: string) {
@@ -207,12 +266,8 @@ export const launcher = cell("launcher", {
     async reveal(s, id: string, what: Place) {
       const d = s.registry.find((x) => x.id === id);
       if (!d) throw new Error(`no app ${id}`);
-      await (await io()).reveal(
-        s.appsDir,
-        { ...d },
-        s.runs[id]?.artifact ?? "",
-        what,
-      );
+      const dir = s.appsDir, artifact = s.runs[id]?.artifact ?? ""; // read before the await
+      await (await io()).reveal(dir, { ...d }, artifact, what);
     },
     async open(s, id: string) {
       const path = s.runs[id]?.artifact,

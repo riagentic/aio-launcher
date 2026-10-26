@@ -16,11 +16,13 @@ from one window. Each app is cloned from git and built on your machine.
 - ⚙️ Settings: install folder, add / remove apps (any git repo, subfolder, extra
   repos, pre-build task)
 - 🛎️ Tray icon — closing the window keeps it running
+- ⬆️ Updates itself: a release build shows **Update launcher to vX** when a
+  newer GitHub release is out (run from source: `git pull`)
 
 ## Apps
 
-amui · bsv · cc · fixable · fjssm · llama.master · machine · mdview · mushradar
-· netmap · protector · spacy · writy
+amui · ayd · bsv · calcaio · cc · fixable · fjssm · llama.master · machine ·
+mdview · mushradar · netmap · protector · Space Invaders · spacy · writy
 
 ## Requirements
 
@@ -48,6 +50,12 @@ deno task compile                  # AppImage → dist/
 ```
 
 Apps go to `~/.aio-launcher/apps` (change it in Settings).
+
+## Release
+
+Push a tag `v<major.minor.commit-count>`: `.github/workflows/release.yml` builds
+every platform on Linux and attaches the builds and their `<os>-<arch>.json`
+manifests to the GitHub release — what a release build's updater reads.
 
 ## How an app is installed
 

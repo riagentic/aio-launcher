@@ -5,6 +5,7 @@ import {
   blankRun,
   checkDef,
   DEFAULT_APPS,
+  goLabel,
   idOf,
   mediaUrl,
   pickArtifact,
@@ -18,6 +19,7 @@ import {
   versionsOf,
   viewOf,
   webOf,
+  withNewDefaults,
 } from "../src/apps.ts";
 
 const run = (o: Partial<ReturnType<typeof blankRun>>) => ({
@@ -182,6 +184,12 @@ Deno.test("versionLabel + mediaUrl: installed vs remote info", () => {
   assertEquals(versionLabel(r), "v0.3 → v0.4");
   assertEquals(versionLabel({ ...r, remote: "a" }), "v0.3");
   assertEquals(versionLabel({ ...blankRun(), latest: r.latest }), "v0.4");
+  assertEquals(goLabel(r), "Update to v0.4");
+  assertEquals(
+    goLabel({ ...r, latest: { ...r.latest, version: "0.3" } }),
+    "Update",
+  ); // only aio moved
+  assertEquals(goLabel({ ...r, remote: "a" }), "Open");
   assertEquals(mediaUrl("x", r, "icon"), "/media/x/icon?v=a%3Asrc%2Ficon.png");
   assertEquals(mediaUrl("x", r, "shot"), "");
 });
@@ -201,4 +209,13 @@ Deno.test("pickArtifact: the file that opens on each OS", () => {
   assertEquals(pickArtifact(f, "windows"), "a.exe"); // not the zip
   assertEquals(pickArtifact(f, "darwin"), "a.app.tar.gz");
   assertEquals(pickArtifact(["a.zip"], "linux"), "");
+});
+
+Deno.test("withNewDefaults: adds unseen defaults, never re-adds a removed one", () => {
+  const ids = DEFAULT_APPS.map((d) => d.id);
+  const mine = { ...DEFAULT_APPS[0]!, id: "mine" };
+  const r = withNewDefaults([mine], ids.filter((id) => id !== "ayd"));
+  assertEquals(r.registry.map((d) => d.id), ["mine", "ayd"]); // removed defaults stay out
+  assertEquals(r.offered.toSorted(), ids.toSorted());
+  assertEquals(withNewDefaults(r.registry, r.offered), r); // idempotent
 });

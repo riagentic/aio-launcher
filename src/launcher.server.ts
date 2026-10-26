@@ -109,6 +109,9 @@ async function run(cmd: string, args: string[], cwd: string) {
       },
     }).output(); // a missing program throws here, synchronously
   } catch (e) {
+    if (e instanceof Deno.errors.NotFound && !(await exists(cwd))) {
+      throw new Error(`folder not found: ${cwd}`);
+    }
     if (e instanceof Deno.errors.NotFound && TOOLS[cmd]) {
       throw new Error(`${cmd} is not installed — get it: ${TOOLS[cmd]}`);
     }
@@ -201,7 +204,8 @@ export async function fetchRepo(appsDir: string, d: AppDef): Promise<string> {
   for (const src of sourcesOf(d)) {
     const dir = join(root, src.dir);
     if (await exists(join(dir, ".git"))) {
-      await sh("git", ["fetch", "--depth=1", "origin", "HEAD"], dir, log);
+      // the URL, not `origin`: a leftover clone of a removed app may point elsewhere
+      await sh("git", ["fetch", "--depth=1", "--", src.repo, "HEAD"], dir, log);
       await sh("git", ["reset", "--hard", "FETCH_HEAD"], dir, log); // launcher-owned clone
     } else {
       await sh("git", ["clone", "--depth=1", "--", src.repo, dir], root, log);
@@ -604,4 +608,54 @@ export async function media(
       },
     })
     : new Response("not found", { status: 404 });
+}
+
+// ── the launcher's own updates ───────────────────────────────────────────────
+
+/** The newest GitHub release, mirrored in the layout aio's updater reads (`<dir>/prod/<os>-<arch>.json`). */
+export const RELEASE_DIR = join(HOME, ".aio-launcher", "release");
+const LATEST = Deno.env.get("AIO_LAUNCHER_RELEASES") ?? // a test release host
+  "https://github.com/riagentic/aio-launcher/releases/latest/download/";
+/** Run from source (deno is the process): nothing to swap — that is `git pull`. */
+export const FROM_SOURCE = /^deno(\.exe)?$/i.test(basename(Deno.execPath()));
+
+/** Copy the newest release's manifests for this machine; `withBuild` also the file they name. */
+export async function mirrorRelease(withBuild: boolean): Promise<void> {
+  const dir = join(RELEASE_DIR, "prod"), plat = `${OS}-${Deno.build.arch}`;
+  await Deno.mkdir(dir, { recursive: true });
+  const keep = new Set<string>();
+  // a zip install reads the kind-specific manifest first, then the platform's
+  for (const name of [`${plat}.json`, `${plat}.electron-zip.json`]) {
+    const r = await fetch(LATEST + name, {
+      signal: AbortSignal.timeout(15_000),
+    });
+    if (r.status === 404) {
+      await r.body?.cancel();
+      continue; // this release has no such manifest
+    }
+    if (!r.ok) {
+      await r.body?.cancel();
+      throw new Error(`launcher release: HTTP ${r.status} for ${name}`);
+    }
+    const text = await r.text();
+    await Deno.writeTextFile(join(dir, name), text);
+    keep.add(name);
+    const file = basename(String(JSON.parse(text).url ?? ""));
+    if (!withBuild || !file) continue;
+    keep.add(file);
+    if (await exists(join(dir, file))) continue;
+    const b = await fetch(LATEST + file);
+    if (!b.ok || !b.body) {
+      await b.body?.cancel();
+      throw new Error(`launcher release: HTTP ${b.status} for ${file}`);
+    }
+    await Deno.writeFile(join(dir, `${file}.part`), b.body); // aio checks its sha256
+    await Deno.rename(join(dir, `${file}.part`), join(dir, file));
+  }
+  // what the newest release does not name is an older one: gone, or it piles up
+  for await (const e of Deno.readDir(dir)) {
+    if (!keep.has(e.name) && (withBuild || e.name.endsWith(".json"))) {
+      await Deno.remove(join(dir, e.name), { recursive: true });
+    }
+  }
 }

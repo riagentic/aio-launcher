@@ -5,7 +5,7 @@ import { Confirm, Menu, type MenuItem, toast } from "aio/ui";
 import {
   actionOf,
   type AppDef,
-  LABEL,
+  goLabel,
   mediaUrl,
   type Place,
   readmeOf,
@@ -76,9 +76,9 @@ export function AppCard(
 ): JSX.Element {
   const d = p.def, r = p.run, id = d.id, act = actionOf(r);
   const [asking, setAsking] = useLocal(false);
-  const info = shownInfo(r), next = r?.latest.version;
+  const info = shownInfo(r);
   const shot = mediaUrl(id, r, "shot");
-  const label = act === "update" && next ? `Update to v${next}` : LABEL[act];
+  const label = goLabel(r);
   const go = () =>
     (act === "open" ? launcher.open(id) : launcher.install(id)).catch(fail);
   const pick = (what: string) =>

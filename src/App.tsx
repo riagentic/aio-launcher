@@ -6,6 +6,7 @@ import { launcher } from "./cell.ts";
 import { Home } from "./ui/Home.tsx";
 import { Settings } from "./ui/Settings.tsx";
 import { GearIcon, Mark, RefreshIcon } from "./ui/icons.tsx";
+import { SelfUpdate } from "./ui/SelfUpdate.tsx";
 
 export default function App(): JSX.Element {
   return (
@@ -16,13 +17,17 @@ export default function App(): JSX.Element {
           AIO APPS LAUNCHER
         </Link>
         <span class="grow" />
+        <SelfUpdate />
         <button
           type="button"
           class="icon ghost"
           aria-label="Check for updates"
           title="Check for updates"
           disabled={launcher.checking}
-          onClick={() => launcher.check()}
+          onClick={() => {
+            launcher.check();
+            launcher.selfCheck();
+          }}
         >
           <RefreshIcon spin={launcher.checking} />
         </button>

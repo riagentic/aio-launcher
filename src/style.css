@@ -11,7 +11,8 @@
   --aio-on-accent: #ffffff;
   --aio-accent-ink: #1d4ed8;
   --aio-tint: #e8effd;
-  --warn: #c2620a;
+  --warn: #a8520a;
+  --on-warn: #ffffff;
   --warn-bg: #fff1e3;
   --shadow: 0 1px 2px rgb(16 24 40 / .05), 0 4px 14px -6px rgb(16 24 40 / .12);
   --shadow-up: 0 2px 4px rgb(16 24 40 / .06),
@@ -34,6 +35,7 @@
     --aio-accent-ink: #7db5ff;
     --aio-tint: #16233a;
     --warn: #ffa95c;
+    --on-warn: #241203;
     --warn-bg: #3a2414;
     --shadow: 0 1px 2px rgb(0 0 0 / .3), 0 6px 18px -8px rgb(0 0 0 / .5);
     --shadow-up: 0 2px 4px rgb(0 0 0 / .3), 0 18px 36px -12px rgb(0 0 0 / .6);
@@ -95,6 +97,14 @@ button {
   padding: 0;
   border-radius: 50%;
   color: inherit;
+}
+.nav .self {
+  padding: .4rem .9rem;
+  border-radius: 999px;
+  font-weight: 600;
+  color: var(--on-warn);
+  background: var(--warn);
+  border: 0;
 }
 main {
   width: 100%;
@@ -397,7 +407,7 @@ main {
   border-color: var(--aio-border);
 }
 .app.update .actions .go.primary {
-  color: #fff;
+  color: var(--on-warn);
   background: var(--warn);
   border-color: var(--warn);
 }

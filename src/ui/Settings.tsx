@@ -51,7 +51,10 @@ export function Settings(): JSX.Element {
         <form
           class="row"
           onSubmit={() =>
-            launcher.setAppsDir(dir ?? "").then(() => setDir(null), fail)}
+            launcher.setAppsDir(dir ?? "").then(() => {
+              setDir(null);
+              launcher.check().catch(fail); // update info + media for the new folder
+            }, fail)}
         >
           <Input
             class="grow"
